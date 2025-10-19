@@ -14,6 +14,7 @@
 #define KERNEL_BEGIN_PADDR          0x80200000
 #define KERNEL_BEGIN_VADDR          0xFFFFFFFFC0200000
 
+#define MAX_BUDDY_ORDER    14
 
 #define KSTACKPAGE          2                           // # of pages in kernel stack
 #define KSTACKSIZE          (KSTACKPAGE * PGSIZE)       // sizeof kernel stack
@@ -58,6 +59,13 @@ typedef struct {
     list_entry_t free_list;         // the list header
     unsigned int nr_free;           // number of free pages in this free list
 } free_area_t;
+
+/* 伙伴系统管理结构体 */
+typedef struct {
+    list_entry_t free_array[MAX_BUDDY_ORDER + 1];  
+    unsigned int max_order;//最大阶                         
+    unsigned int nr_free;                          
+} free_buddy_t;
 
 #endif /* !__ASSEMBLER__ */
 
