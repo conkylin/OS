@@ -1,0 +1,30 @@
++ cc kern/init/entry.S
++ cc kern/init/init.c
+In file included from ./kern/include/pmm.h:4,
+                 from kern/init/init.c:3:
+./kern/include/types.h:4:21: error: conflicting types for 'int8_t'
+    4 | typedef signed char int8_t;
+      |                     ^~~~~~
+In file included from kern/init/init.c:2:
+libs/defs.h:16:14: note: previous declaration of 'int8_t' was here
+   16 | typedef char int8_t;
+      |              ^~~~~~
+In file included from ./kern/include/pmm.h:4,
+                 from kern/init/init.c:3:
+./kern/include/types.h:13:23: error: conflicting types for 'uintptr_t'
+   13 | typedef unsigned long uintptr_t;
+      |                       ^~~~~~~~~
+In file included from kern/init/init.c:2:
+libs/defs.h:42:18: note: previous declaration of 'uintptr_t' was here
+   42 | typedef uint64_t uintptr_t;
+      |                  ^~~~~~~~~
+In file included from ./kern/include/pmm.h:4,
+                 from kern/init/init.c:3:
+./kern/include/types.h:14:23: error: conflicting types for 'size_t'
+   14 | typedef unsigned long size_t;
+      |                       ^~~~~~
+In file included from kern/init/init.c:2:
+libs/defs.h:45:19: note: previous declaration of 'size_t' was here
+   45 | typedef uintptr_t size_t;
+      |                   ^~~~~~
+make: *** [Makefile:116：obj/kern/init/init.o] 错误 1

@@ -26,7 +26,22 @@ first-fit 连续物理内存分配算法作为物理内存分配一个很基础�
 
 - 你的 Best-Fit 算法是否有进一步的改进空间？
 
+### 扩展练习Challenge：buddy system（伙伴系统）分配算法
+Buddy System算法把系统中的可用存储空间划分为存储块(Block)来进行管理, 每个存储块的大小必须是2的n次幂(Pow(2, n)), 即1, 2, 4, 8, 16, 32, 64, 128...
+
+参考伙伴分配器的一个极简实现， 在ucore中实现buddy system分配算法，要求有比较充分的测试用例说明实现的正确性，需要有设计文档。
+
+### 扩展练习Challenge：任意大小的内存单元slub分配算法
+slub算法，实现两层架构的高效内存单元分配，第一层是基于页大小的内存分配，第二层是在第一层基础上实现基于任意大小的内存分配。可简化实现，能够体现其主体思想即可。
+
+参考linux的slub分配算法/，在ucore中实现slub分配算法。要求有比较充分的测试用例说明实现的正确性，需要有设计文档。
+
+### 扩展练习Challenge：硬件的可用物理内存范围的获取方法
+
+如果 OS 无法提前知道当前硬件的可用物理内存范围，请问你有何办法让 OS 获取可用物理内存范围？
+
 ---
+
 ## 三、实验过程及截图
 
 首先我们需要先测试代码的正确性，我们就执行了make qemu指令得到理想的结果：
@@ -34,6 +49,14 @@ first-fit 连续物理内存分配算法作为物理内存分配一个很基础�
 
 在修改完best-fit算法后，我们将pmm.c文件修改后，完成了测试make grade得到了实验结果：
 ![](lab2_image2.png)
+
+以及我们challenge的结果截图：
+
+buddy:
+![](lab2_buddy.png)
+
+slub:
+![](lab2_slub.png)
 
 ---
 
@@ -98,6 +121,113 @@ Best-Fit算法选择满足需求的最小空闲块，以减少碎片。本次实
   使用大小分类的空闲链表，将空闲块按大小分组，加速搜索。因为在按地址顺序排序的搜索过程中，在我们设定的正好等于所需空间大小的块概率很低，因此几乎每次都将要遍历整个链表时间复杂度会很高，而用了大小顺序就可以解决这一个问题。
 
   此外还有一种想法就是在按地址顺序进行搜索的过程中，可以设定一个误差范围，即当我们所需空间的大小小于搜索到的内存块时只要在设置的误差范围内就直接使用，也就是中和一下first和best的逻辑。
+
+### challenge1，buddy算法实现：
+#### 关键代码分析：
+
+1. buddy_init()：
+   
+        buddy_init函数负责初始化伙伴系统的全局数据结构，为内存分配做准备
+        。该函数不接收参数，主要执行以下操作：
+
+        ​初始化空闲链表数组​：通过循环遍历从0到MAX_BUDDY_ORDER的每个阶（order），使用list_init初始化buddy_array中每个阶对应的空闲链表。这些链表用于管理不同大小的空闲内存块。
+
+        ​重置系统状态变量​：将max_order（当前最大可用阶数）和nr_free（总空闲页面数）设置为0，确保系统初始状态为空闲。
+
+        ​作用​：此函数在系统启动时调用一次，确保所有数据结构处于就绪状态。例如，若MAX_BUDDY_ORDER为10，则初始化11个链表（阶0到10），分别管理1页、2页、4页直至1024页的空闲块。
+
+2. buddy_init_memmap()
+   
+        buddy_init_memmap函数将一段物理内存初始化为伙伴系统可管理的结构，其参数包括起始页面指针base和页面数量n。实现逻辑如下：
+
+        ​计算可用内存大小​：使用辅助函数Find_The_Small_2(n)找到不大于n的最大2的幂次方页面数（如n=1000时返回512），并通过Get_Order_Of_2计算对应的阶（如512页对应阶9）。
+
+        ​初始化页面属性​：遍历每个页面，清除保留标志以外的所有状态，设置引用计数为0，并标记为未分配。例如，代码中通过p->flags = 0和set_page_ref(p, 0)重置页面元数据。
+
+        ​设置基页属性并加入空闲链表​：将整个内存块作为单个空闲块处理，设置基页的property字段为阶数，并将其插入对应阶的空闲链表（如阶9的链表）。同时更新max_order和nr_free。
+
+        ​关键点​：该函数确保内存块按2的幂次方对齐，为后续分裂合并奠定基础。例如，若初始内存为1000页，仅512页被初始化，剩余488页暂不管理。
+
+3. buddy_alloc_pages()
+   
+        buddy_alloc_pages函数用于分配连续物理页面，其核心是通过分裂操作匹配请求大小。算法步骤如下：
+
+        ​请求大小对齐​：使用Find_The_Big_2(n)将请求页面数向上对齐到最近的2的幂次方（如n=257时对齐到512），并计算所需阶req_order。
+
+        ​查找合适空闲块​：从req_order开始向上扫描空闲链表（如阶9无空闲则查阶10），直到找到非空链表。若所有高阶均无空闲，返回失败。
+
+        ​块分裂处理​：若当前块阶高于请求阶（如找到阶10的块但需阶9），递归调用buddy_split进行分裂。分裂时，将大块均分为两个伙伴块，并添加到低一阶链表。例如，阶10的块（1024页）分裂为两个阶9的块（各512页）。
+
+        ​分配与更新​：从目标阶链表取出块，清除其"属性"标志并标记为"已保留"，更新空闲页面计数nr_free。
+
+        ​性能特征​：分配时间复杂度为O(log N)，其中N是最大阶数，确保高效性。
+
+4. buddy_free_pages()
+   
+        buddy_free_pages函数释放已分配页面，并尝试合并伙伴块以减少碎片。其实现包括：
+
+        ​页面状态恢复​：遍历释放的页面，清除"已保留"标志，设置"属性"标志，并将基页重新加入对应阶的空闲链表。
+
+        ​伙伴合并逻辑​：循环检查当前块的伙伴块是否空闲且大小相同。通过get_buddy计算伙伴地址（利用地址异或操作：buddy_address = current_address ^ (1 << order)），并验证其物理地址是否连续。若伙伴空闲，则合并两者，生成更高阶的块，并递归检查进一步合并可能。
+
+        ​合并条件​：伙伴块需满足同阶、空闲、地址相邻三个条件。合并后，新块地址取两者中较低者，并更新阶数和链表位置。
+
+        ​作用​：此过程有效减少外部碎片，确保内存利用率。例如，两个相邻的阶3块（各8页）可合并为一个阶4块（16页）。
+
+#### 测试样例解释：
+
+在我们的测试样例中，我们首先进行的是一整个内存的分配和释放，其次进行的是对于四个大小为2的内存的分配和释放，然后进行了大小为257的块的分配和释放，由输出结果看：
+
+    After allocating a block of size 16384 pages:
+
+    ---------- Buddy System Free Lists (Order 0 to 14) ----------
+
+    No free blocks in this range!
+
+    Total free pages: 0
+
+    After freeing the block of size 16384 pages:
+
+    ---------- Buddy System Free Lists (Order 0 to 14) ----------
+
+    Order 14 (16384 pages): [addr:0xffffffffc020f318] (total 1 blocks)
+
+    Total free pages: 16384
+
+我们查看空闲块确实是分配并释放成功了，在我们的第二个测试中：
+
+    Order 3 (   8 pages): [addr:0xffffffffc020f458] (total 1 blocks)
+    Order 4 (  16 pages): [addr:0xffffffffc020f598] (total 1 blocks)
+    Order 5 (  32 pages): [addr:0xffffffffc020f818] (total 1 blocks)
+    Order 6 (  64 pages): [addr:0xffffffffc020fd18] (total 1 blocks)
+    Order 7 ( 128 pages): [addr:0xffffffffc0210718] (total 1 blocks)
+    Order 8 ( 256 pages): [addr:0xffffffffc0211b18] (total 1 blocks)
+    Order 9 ( 512 pages): [addr:0xffffffffc0214318] (total 1 blocks)
+    Order 10 (1024 pages): [addr:0xffffffffc0219318] (total 1 blocks)
+    Order 11 (2048 pages): [addr:0xffffffffc0223318] (total 1 blocks)
+    Order 12 (4096 pages): [addr:0xffffffffc0237318] (total 1 blocks)
+    Order 13 (8192 pages): [addr:0xffffffffc025f318] (total 1 blocks)
+    Total free pages: 16376
+
+也是证明了我们拆分块的逻辑是正确的。
+以及最后合并成功说明我们释放块的逻辑也是正确的。
+
+第三个测试样例中，我们测试分配257的大小的块，此时输出结果显示我们申请了512的大小，证明我们将每一个块都设置为2的阶的逻辑也是正确的，且寻找合适的块的逻辑也正确：
+
+    After allocating a block of size 257 (adjusted to 512 pages):
+    ---------- Buddy System Free Lists (Order 0 to 14) ----------
+    Order 9 ( 512 pages): [addr:0xffffffffc0214318] (total 1 blocks)
+    Order 10 (1024 pages): [addr:0xffffffffc0219318] (total 1 blocks)
+    Order 11 (2048 pages): [addr:0xffffffffc0223318] (total 1 blocks)
+    Order 12 (4096 pages): [addr:0xffffffffc0237318] (total 1 blocks)
+    Order 13 (8192 pages): [addr:0xffffffffc025f318] (total 1 blocks)
+    Total free pages: 15872
+
+buddy算法实现完成。
+
+### challenge2，slub算法实现：
+
+
 
 ---
 

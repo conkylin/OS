@@ -48,7 +48,6 @@ static size_t Find_The_Big_2(size_t n) {
     return result;
 }
 
-// 分块操作
 static void buddy_split(size_t n) {
     assert(n > 0 && n <= max_order);
     assert(!list_empty(&(buddy_array[n])));
@@ -61,13 +60,11 @@ static void buddy_split(size_t n) {
     size_t split_size = 1 << (n - 1);
     struct Page *page2 = page1 + split_size;
     
-    // 设置分裂后块的属性
     page1->property = n - 1;
     page2->property = n - 1;
     SetPageProperty(page1);
     SetPageProperty(page2);
     
-    // 从原链表中删除
     list_del(le);
     
     // 将分裂后的块添加到低一阶链表
@@ -81,18 +78,16 @@ static struct Page *get_buddy(struct Page *page, unsigned int order) {
     if (order > MAX_BUDDY_ORDER) return NULL;
     
     // 计算当前块的大小
-    size_t real_block_size = 1 << order;  // 2^block_size 个页面
+    size_t real_block_size = 1 << order;  
     
-    // 计算基地址（假设这是内存管理的起始地址）
     struct Page *base_addr = (struct Page *)0xffffffffc020f318;
     
-    // 计算伙伴块的相对偏移量
     size_t relative_block_addr = (size_t)page - (size_t)base_addr;
     
-    // 计算块的大小（字节为单位），假设每个struct Page大小为0x28字节
+    // 计算块的大小
     size_t sizeOfPage = real_block_size * sizeof(struct Page);
     
-    // 计算伙伴块的相对地址（通过异或操作切换伙伴位）
+    // 计算伙伴块的相对地址
     size_t buddy_relative_addr = relative_block_addr ^ sizeOfPage;
     
     // 计算伙伴块的真实地址
@@ -237,8 +232,6 @@ static void buddy_free_pages(struct Page *base, size_t n) {
         p++;
     }
     base->property = order;
-
-    // 2. 关键修改：先将被释放的块加入对应的空闲链表
     list_add(&(buddy_array[order]), &(base->page_link));
     nr_free += freed_pages;
 
@@ -269,14 +262,13 @@ static void buddy_free_pages(struct Page *base, size_t n) {
         size_t expected_difference = 1 << (current_order + PGSHIFT);
         
         if (pa_difference != expected_difference) {
-            break; // 不是真正的伙伴关系
+            break; 
         }
         
-        // 简化：直接尝试从链表中删除伙伴块
         int buddy_was_in_list = 0;
         list_entry_t *le = &(buddy->page_link);
         if (!list_empty(le)) {
-            list_del_init(le); // 安全删除
+            list_del_init(le); 
             buddy_was_in_list = 1;
         }
         
@@ -303,11 +295,7 @@ static void buddy_free_pages(struct Page *base, size_t n) {
         // 将合并后的块加入到更高阶的链表中
         list_add(&(buddy_array[current_order]), &(current_block->page_link));
         
-        cprintf("Successful merge: order %d -> %d, base pa: 0x%x\n", 
-               current_order - 1, current_order, page2pa(current_block));
     }
-    // 如果发生了合并，合并后的块已经在对应链表中
-    // 如果没有发生合并，当前块在第2步已经加入了链表
 }
 
 // 获取空闲页面数
@@ -322,6 +310,7 @@ static void buddy_check(void) {
     // 1. 开始时直接查看空闲状态
     cprintf("1. Initial free state:\n");
     show_buddy_array(0, max_order);
+
     // 6. 分配一个16384页的块
     struct Page *p_large2;
     size_t n2 = 16384;
@@ -333,6 +322,7 @@ static void buddy_check(void) {
     free_pages(p_large2, n2);
     cprintf("7. After freeing the block of size %u pages:\n", n2);
     show_buddy_array(0, max_order);
+
     // 2. 分配四个单页并查看状态
     struct Page *p0, *p1, *p2, *p3;
     p0 = p1 = p2 = p3 = NULL;
@@ -369,8 +359,6 @@ static void buddy_check(void) {
     free_pages(p_large1, n1);
     cprintf("5. After freeing the block of size %u:\n", n1);
     show_buddy_array(0, max_order);
-    
-    
     
     cprintf("Buddy system check completed successfully!\n");
 }
