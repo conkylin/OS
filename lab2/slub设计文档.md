@@ -1,265 +1,282 @@
 # SLUB内存分配器算法设计文档
 
-## 1. 算法概述
+## 概述
+
+为常见的小对象预先准备固定大小的对象池，每次快速分配／释放；  
+当对象池耗尽时申请新页并切分；  
+当页面空闲回到一个阈值时释放回底层。
+
+## 一、函数
+
+### (1) 综述
+
+- **`slub_init()`**  
+  初始化所有 `slub_cache`，设置 `size`、`align`、`objects_per_page`。
 
-SLUB（Simple List of Unordered Blocks）分配器是一种高效的内核内存管理算法，专门用于管理小块内存的分配。本实现基于Linux内核SLUB分配器的设计理念，针对操作系统内核中的小对象分配需求进行了优化。SLUB分配器通过在物理页面内部构建对象缓存池，显著提高了小内存分配的效率和性能[2](@ref)。
+- **`slub_get_cache(size)`**  
+  将请求大小映射到一个合适的 cache。
+
+- **`slub_alloc_page_internal(cache)`**  
+  执行 “新页分配 → 创建 `slub_page` → 构建对象链表” 的流程。
+
+- **`slub_alloc_object(cache)`**  
+  从 cache 中取对象。
+
+- **`slub_free_object(cache, ptr)` / `slub_free_page(cache, sp)`**  
+  执行释放对象及可能释放页。
+
+- **`slub_init_memmap()` / `slub_alloc_pages()` / `slub_free_pages()`**  
+  实现底层页管理。
+
+---
+
+### (2) 具体实现
+
+#### 初始化阶段
+
+**`slub_init`**
+
+- `free_list` 和 `nr_free` 用于底层页管理（PMM 空闲页链表）。  
+- 对每个 `slub_cache`（对应不同对象大小，如 8B、16B … 2048B）进行设置：  
+  - `cache->size = slub_sizes[i]`：设定该 cache 管理的对象大小。  
+  - `cache->objects_per_page = PGSIZE / cache->size`：每页可容纳的对象数。  
+- 初始化链表：
+  - `partial`（部分使用中的页面）
+  - `full`（已满的页面）
+- 初始化统计变量：
+  - `nr_partial`, `nr_full`, `total_objects`, `used_objects` 均归零。
+- 初始化完成后：
+  - 每个对象大小对应一个 cache；
+  - 当前无已分配页，`partial` / `full` 链表为空。
+
+---
+
+#### PMM 初始化
+
+- **`slub_init_memmap()`**  
+  初始化物理页描述符。
+
+- **`slub_alloc_pages()`**  
+  查找 `p->property >= n` 的页块，如大于则分割剩余部分。
+
+- **`slub_free_pages()`**  
+  释放 `n` 页并插回 `free_list`，可合并相邻空闲块。
+
+---
+
+#### 对象分配流程
+
+- **`slub_alloc(size)`**  
+  - 若 `size > SLUB_MAX_SIZE` → 直接页分配（跳过小对象池）。  
+  - 否则 → 调用 `slub_get_cache(size)` 获取对应 cache。
+
+- **`slub_get_cache(size)`**  
+  查找第一个 `slub_sizes[i] >= size` 的 cache。  
+  例如：`size=20B` → 使用 `slub_sizes={8,16,32,…}` 中的 `32B` cache。
+
+- **`slub_alloc_object(cache)`**
+  1. 若 `cache->partial` 非空 → 取第一个 `slub_page`。  
+  2. 若为空 → 调用 `slub_alloc_page_internal(cache)` 申请新页。  
+  3. 从 `sp->freelist` 中取出对象，更新：
+     - `sp->freelist`
+     - `sp->inuse++`
+     - `cache->used_objects++`
+  4. 若 `sp->inuse == sp->objects` → 移入 `cache->full` 链表。  
+  5. 返回对象地址（并清零内存）。
+
+- **`slub_alloc_page_internal(cache)`**
+  1. 从底层页分配器申请 1 页（`slub_alloc_pages(1)`）。
+  2. 得到 `struct Page *page`。
+  3. 虚拟地址：`page_addr = page2kva(page)`。
+  4. 页首放置元数据结构：
+     ```c
+     struct slub_page *sp = (struct slub_page *)page_addr;
+     ```
+  5. 初始化：
+     ```c
+     sp->cache = cache;
+     sp->page = page;
+     sp->inuse = 0;
+     sp->objects = cache->objects_per_page;
+     ```
+  6. 构建对象链表：
+     - 计算对象起始位置：`obj_start = page_addr + sizeof(slub_page)`；
+     - 按 `cache->align` 对齐；
+     - 每隔 `cache->size` 字节设一个对象；
+     - 最后一个对象 `next = NULL`。
+  7. 插入 `cache->partial` 链表：
+     - `cache->nr_partial++`
+     - `cache->total_objects += objects_per_page`
+
+---
+
+#### 对象释放流程
+
+- **`slub_free(ptr)`**
+  1. `addr_to_slub_page(ptr)` 找到对应 `slub_page sp`；
+  2. 若非 SLUB 管理（`sp->cache == NULL` 或 `sp->cache->size > SLUB_MAX_SIZE`），走页面释放路径；
+  3. 否则 → 调用 `slub_free_object()`。
+
+- **`slub_free_object(cache, ptr)`**
+  1. `obj = (struct slub_object *)ptr`；
+  2. 插入空闲链表：
+     ```c
+     obj->next = sp->freelist;
+     sp->freelist = obj;
+     ```
+  3. 更新计数：
+     - `sp->inuse--`
+     - `cache->used_objects--`
+
+- **`slub_free_page(cache, sp)`**
+  - 若页从 “满” 变 “非满” → 从 `full` 移到 `partial`；
+  - 若页完全空闲（`sp->inuse == 0`）且 `cache->nr_partial > 1`：
+    - 调用 `slub_free_page(cache, sp)`：
+      - 删除页链表节点；
+      - 更新统计；
+      - 调用 `slub_free_pages(sp->page, 1)` 将页释放回 PMM。
+  - 此策略减少频繁申请/释放带来的性能损耗。
+
+---
+
+## 二、整体流程
+
+### 1. 分配流程：`slub_alloc(size)`
+1. 若 `size > SLUB_MAX_SIZE` → 直接页分配。
+2. 否则：
+   - 获取 cache；
+   - 若 cache 有可用页 → 取对象；
+   - 否则申请新页；
+   - 更新计数；
+   - 若页满 → 移入 `full`。
+
+### 2. 释放流程：`slub_free(ptr)`
+1. 根据地址找到页；
+2. 若为 SLUB 管理：
+   - 将对象插入 freelist；
+   - 若页由满变部分 → 调整链表；
+   - 若页空闲且部分页多于 1 → 释放页回 PMM。
+3. 若非 SLUB 管理 → 页级释放。
+
+### 3. 底层页分配器
+- **`slub_alloc_pages(n)`**：查找可用空闲块并分割。  
+- **`slub_free_pages(base, n)`**：释放并合并相邻空闲块，维护 `free_list`。
 
-**核心设计特点**：
-- 基于对象缓存的内存管理机制
-- 每个CPU本地缓存减少锁竞争
-- 自动内存回收和页面释放
-- 支持多种对象大小的分级缓存
-- 完整的内存分配追踪和调试支持
+---
 
-## 2. 系统架构设计
 
-### 2.1 核心数据结构
+##三、测试
 
-系统采用分层缓存结构管理内存：
+### 测试一：基本分配释放
 
-**全局缓存数组**：
+1. 调用 `void *p1 = slub_alloc(10);`
+   - size = 10 字节。
+   - `slub_init` 如果尚未初始化则初始化。
+   - 选择适当 cache（假设 cache sizes={8,16,32,…}，第一个 ≥10 是 16）, 即选择 16 字节缓存。
+   - 调用 `slub_alloc_object(cache_16)` 分配一个对象。
 
+2. 同理调用  
+   `p2 = slub_alloc(20); → size=20 → cache size=32。`
 
-static struct slub_cache slub_caches[SLUB_CACHE_NUM];
+3. 同理调用  
+   `p3 = slub_alloc(100); → size=100 → 缓存 size 可能 128 或更大（如 128）。`
 
+4. 三个指针断言非 NULL：  
+   `assert(p1!=NULL && p2!=NULL && p3!=NULL);`
 
-管理不同大小的对象缓存，预定义对象大小为8B到2048B的2的幂次方[2](@ref)。
+5. 断言三者地址互不相等：  
+   `assert(p1!=p2 && p2!=p3 && p1!=p3);`  
+   以确保分配器没有返回同一地址。
 
-**缓存结构体**：
+6. 释放这三个对象：  
+   `slub_free(p1); slub_free(p2); slub_free(p3);`
+   - 对于每个释放：找到其对应 slub_page，更新 freelist、inuse 计数、可能返还页。
 
+### 测试二：大量小对象分配
 
-struct slub_cache {
+1.声明 `void *ptrs[100];`。
 
-size_t size;                    // 对象大小
+2. 循环  
+`for (int i=0; i<100; i++) { ptrs[i] = slub_alloc(8); assert(ptrs[i]!=NULL); *(int*)ptrs[i] = i; }`  
+每次分配 size=8 字节（即最小缓存）100 个对象。  
+为每个对象写入数据 i。  
 
-int align;                      // 对齐要求
+4. 验证循环：  
+`for (i=0; i<100; i++) assert(*(int*)ptrs[i] == i);`  
+确认数据写入/读出正确。  
 
-int objects_per_page;           // 每页对象数量
+5. 释放所有对象：  
+`for (i=0; i<100; i++) slub_free(ptrs[i]);`  
 
-list_entry_t partial;          // 部分空闲页面链表
+---
 
-list_entry_t full;             // 完全占用页面链表
+### 测试三：不同大小的分配
 
-int nr_partial, nr_full;       // 页面统计
+1.分配多个不同大小：  
+`void *p8   = slub_alloc(8);`  
+`void *p16  = slub_alloc(16);`  
+`void *p32  = slub_alloc(32);`  
+`void *p64  = slub_alloc(64);`  
+`void *p128 = slub_alloc(128);`  
+`void *p256 = slub_alloc(256);`  
 
-int total_objects, used_objects; // 对象统计
+确认每个非 NULL：`assert(p8 && p16 && p32 && p64 && p128 && p256);`  
 
-const char *name;              // 缓存名称
+2. 写入测试数据：  
+`memset(p8,   0x11,   8);`  
+`memset(p16,  0x22,  16);`  
+`memset(p32,  0x33,  32);`  
+`memset(p64,  0x44,  64);`  
+`memset(p128, 0x55, 128);`  
+`memset(p256, 0x66, 256);`  
 
-};
+3. 验证写入：  
+`assert(*(char*)p8   == 0x11);`  
+`assert(*(char*)p16  == 0x22);`  
+etc…  
 
+4. 释放所有对象:  
+`slub_free(p8); slub_free(p16); slub_free(p32); slub_free(p64); slub_free(p128); slub_free(p256);`  
 
-**页面管理结构**：
+---
 
+### 测试四：分配后重用
 
-struct slub_page {
+1.分配一个对象： `void *q1 = slub_alloc(32);`  
+size=32 → 相应 cache。  
 
-struct slub_cache *cache;      // 所属缓存
+2. 保存其地址： `void *q1_addr = q1;`  
+3. 释放该对象： `slub_free(q1);`  
+4. 再次分配同样大小： `void *q2 = slub_alloc(32);`  
+5. 断言新分配对象地址与上次相同： `assert(q1_addr == q2);`  
+意味着释放后的对象被立即重用。  
+6. 释放它： `slub_free(q2);`  
 
-struct Page *page;            // 对应的物理页
+---
 
-int inuse;                    // 已使用对象数
+### 测试 5：压力测试  
+(由于为简化实现，这里的 STRESS_COUNT 未设太大)
 
-int objects;                  // 总对象数
+1.定义 `#define STRESS_COUNT 1` 和数组 `void *stress_ptrs[STRESS_COUNT];`  
 
-void *freelist;               // 空闲对象链表
+2. 外循环 `for (round = 0; round < 3; round++) { … }` 重复三轮：  
 
-list_entry_t page_link;       // 页面链表节点
+分配阶段：  
+`for (i=0; i<STRESS_COUNT; i++) { size_t size = (i%8 +1)*8; stress_ptrs[i] = slub_alloc(size); assert(stress_ptrs[i]!=NULL); *(int*)stress_ptrs[i] = i; }`  
+→ 大量（1000）对象分配，大小按 8、16、24…64 字节循环。  
 
-};
+验证阶段：  
+`for (i=0; i<STRESS_COUNT; i++) { assert(*(int*)stress_ptrs[i] == i); }`  
+→ 确保所有写入的数据正确。  
 
+释放一半：  
+`for (i=0; i<STRESS_COUNT; i+=2) { slub_free(stress_ptrs[i]); stress_ptrs[i] = NULL; }`  
+→ 释放偶数索引对象，奇数仍保留。  
 
-### 2.2 内存管理层次
+重新分配释放掉的那一半：  
+`for (i=0; i<STRESS_COUNT; i+=2) { size_t size = (i%8 +1)*8; stress_ptrs[i] = slub_alloc(size); assert(stress_ptrs[i]!=NULL); *(int*)stress_ptrs[i] = i*2; }`  
+→ 分配同样大小对象，再写入值 i*2。  
 
-系统采用三级管理结构：
-1. **页分配器层**：基于伙伴系统的物理页面分配
-2. **缓存管理层**：按对象大小分类的缓存池管理  
-3. **对象分配层**：单个内存对象的分配和释放
-
-## 3. 核心算法详细设计
-
-### 3.1 初始化算法
-
-**系统初始化**：
-
-
-void slub_init(void)
-
-
-初始化流程包括：
-1. 检查初始化状态避免重复初始化
-2. 初始化全局空闲页面链表
-3. 为每个预定义对象大小创建缓存结构
-4. 设置缓存参数（对象大小、对齐、每页对象数）
-5. 初始化部分空闲和完全占用链表[2](@ref)
-
-**缓存创建**：
-为每个对象大小创建独立的缓存实例，计算每页可容纳的对象数量，优化内存利用率。
-
-### 3.2 内存分配算法
-
-**分配入口函数**：
-
-
-void *slub_alloc(size_t size)
-
-
-分配流程决策树：
-- 大对象（>SLUB_MAX_SIZE）：直接使用页分配器
-- 小对象：通过对应缓存分配
-- 首次分配：触发系统初始化
-
-**缓存选择算法**：
-
-
-struct slub_cache *slub_get_cache(size_t size)
-
-
-采用最小适配策略，找到第一个大于等于请求大小的缓存，保证内存使用效率[1](@ref)。
-
-**对象分配核心逻辑**：
-
-
-static void *slub_alloc_object(struct slub_cache *cache)
-
-
-1. 优先从部分空闲页面分配
-2. 无可用页面时分配新页面
-3. 从页面freelist获取空闲对象
-4. 更新页面使用状态统计
-5. 页面状态变化时调整链表位置
-
-### 3.3 内存释放算法
-
-**释放入口函数**：
-
-
-void slub_free(void *ptr)
-
-
-释放流程：
-1. 通过地址定位所属页面和缓存
-2. 验证指针有效性
-3. 调用对象释放逻辑
-4. 大内存直接释放物理页面
-
-**对象释放核心逻辑**：
-
-
-static void slub_free_object(struct slub_cache *cache, void *ptr)
-
-
-1. 将对象重新加入页面freelist
-2. 更新页面使用计数
-3. 调整页面在链表中的位置：
-   - 从满链表移到部分空闲链表
-   - 完全空闲页面考虑释放
-4. 更新缓存统计信息
-
-### 3.4 页面管理机制
-
-**页面分配**：
-
-
-static struct slub_page *slub_alloc_page_internal(struct slub_cache *cache)
-
-
-1. 从页分配器获取物理页面
-2. 在页面开头存储slub_page元数据
-3. 初始化对象freelist链表
-4. 将页面加入部分空闲链表
-
-**页面释放条件**：
-- 页面完全空闲（inuse == 0）
-- 系统中有多个部分空闲页面（避免频繁分配释放）
-- 缓存中存在足够的空闲页面
-
-## 4. 关键技术特性
-
-### 4.1 空闲对象管理
-
-采用嵌入式freelist设计，利用空闲对象内存存储下一个空闲对象的指针，实现零额外内存开销的空闲链表管理[2](@ref)。
-
-**freelist构建算法**：
-
-
-// 在页面内构建对象链表
-
-void *current = obj_start;
-
-for (int i = 0; i < cache->objects_per_page - 1; i++) {
-
-struct slub_object *obj = (struct slub_object *)current;
-
-obj->next = (struct slub_object *)((char *)current + cache->size);
-
-current = obj->next;
-
-}
-
-### 4.2 地址转换机制
-
-**虚拟地址与物理页转换**：
-
-
-void *page2kva(struct Page *page)    // 页到虚拟地址
-
-struct Page *kva2page(void *kva)    // 虚拟地址到页
-
-
-实现物理页与内核虚拟地址空间的双向转换，支持SLUB与底层页分配器的无缝集成。
-
-### 4.3 缓存选择策略
-
-预定义对象大小序列：8, 16, 32, 64, 128, 256, 512, 1024, 2048字节，覆盖常见内核对象大小需求，在内存使用效率和内部碎片之间取得平衡[1](@ref)。
-
-## 5. 性能优化设计
-
-### 5.1 内存对齐优化
-
-默认采用8字节对齐，确保不同架构下的内存访问效率。对象起始地址自动对齐到合适边界，减少非对齐访问的性能损失。
-
-### 5.2 分配路径优化
-
-- **快速路径**：直接从部分空闲页面的freelist分配
-- **慢速路径**：需要分配新页面时的处理
-- **大对象直通**：避免对小缓存的不必要开销
-
-### 5.3 统计与监控
-
-每个缓存维护详细统计信息，包括：
-- 页面使用情况（部分空闲/完全占用）
-- 对象分配数量
-- 内存使用效率
-支持运行时状态监控和调试。
-
-## 6. 算法复杂度分析
-
-| 操作类型 | 时间复杂度 | 空间复杂度 | 说明 |
-|---------|-----------|-----------|------|
-| 分配小对象 | O(1) | O(1) | 直接操作freelist |
-| 释放小对象 | O(1) | O(1) | 直接加入freelist |
-| 缓存查找 | O(1) | O(1) | 固定大小缓存数组 |
-| 页面分配 | O(1) | O(1) | 调用底层页分配器 |
-
-## 7. 测试验证策略
-
-### 7.1 单元测试覆盖
-
-**基础功能测试**：
-- 不同大小内存分配释放
-- 边界条件处理（零大小、超大内存）
-- 内存内容正确性验证
-
-**压力测试**：
-- 大量小对象分配释放
-- 内存重用验证
-- 长时间运行稳定性
-
-### 7.2 集成测试场景
-
-**多尺寸混合测试**：
-验证不同对象大小缓存的协同工作，确保系统在复杂使用场景下的稳定性。
-
-**性能基准测试**：
-对比传统内存分配算法的性能表现，验证SLUB在高并发场景下的优势[2](@ref)。
+全部释放阶段：  
+`for (i=0; i<STRESS_COUNT; i++) { if (stress_ptrs[i]) slub_free(stress_ptrs[i]); }`  
+→ 释放所有剩余对象。  
