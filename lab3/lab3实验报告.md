@@ -46,7 +46,7 @@ RISC-V包含三个特权级：
 ### 3.1 练习1：完善时钟中断处理
 
 在`kern/trap/trap.c`的`interrupt_handler`函数中，针对时钟中断（`IRQ_S_TIMER`）添加处理逻辑：
-
+```c
       case IRQ_S_TIMER:
       // 设置下一次时钟中断
       clock_set_next_event();
@@ -60,7 +60,7 @@ RISC-V包含三个特权级：
       sbi_shutdown();
       }
       break;
-
+```
 **实现过程详细分析**：
 
 **时钟初始化阶段**：系统启动时，在`clock_init()`函数中完成时钟中断的初始化工作。首先通过`set_csr(sie, MIP_STIP)`指令使能S模式的时钟中断，确保CPU能够响应定时器事件。接着调用`clock_set_next_event()`设置第一次时钟中断的时间点，该函数通过SBI调用设置定时器，使其在当前时间加上固定间隔后触发中断。最后初始化计数器`ticks`为0，用于记录中断发生次数。
@@ -113,10 +113,61 @@ RISC-V包含三个特权级：
    - 不恢复的原因：这些寄存器记录的是中断发生时的瞬时状态，在处理完成后已无实际意义。例如，`scause`的值仅对当前中断有效，下次中断会有新值；`stval`中的故障地址在页面错误处理完成后也不再需要。恢复它们只会增加不必要的开销，且可能覆盖有用的状态信息
    - 这种设计体现了状态寄存器的临时性特点，与需要保持一致的通用寄存器形成对比
 
+#### Challenge3：完善异常中断处理
+**实现过程**:
+
+在kern/trap/trap.c的exception_handler函数中，我们针对非法指令异常（CAUSE_ILLEGAL_INSTRUCTION）和断点异常（CAUSE_BREAKPOINT）添加了处理逻辑：
+```c
+case CAUSE_ILLEGAL_INSTRUCTION:
+    // 非法指令异常处理
+    cprintf("Exception type: Illegal instruction\n");
+    cprintf("Illegal instruction caught at 0x%08x\n", tf->epc);
+    tf->epc += 4;  // 更新epc寄存器，跳过异常指令
+    break;
+    
+case CAUSE_BREAKPOINT:
+    // 断点异常处理
+    cprintf("Exception type: breakpoint\n");
+    cprintf("ebreak caught at 0x%08x\n", tf->epc);
+    tf->epc += 4;  // 更新epc寄存器，跳过ebreak指令
+    break;
+```
+**异常触发机制**:
+
+为了测试异常处理逻辑，我们在kern_init函数中添加了异常触发代码：
+
+```c
+// 触发非法指令异常
+void sbi_trigger_illegal_instruction(void) {
+    __asm__ volatile (".word 0x00000000");  // 嵌入非法指令
+}
+
+// 触发断点异常  
+void sbi_trigger_breakpoint(void) {
+    __asm__ volatile ("ebreak");  // 执行ebreak指令
+}
+```
+​指令地址处理​：tf->epc寄存器保存了触发异常的指令地址。处理异常后，需要将epc增加适当的值4以跳过当前异常指令。
+
+​输出信息格式​：按照实验要求，输出格式化的异常信息，包括异常类型和触发地址。
+
+challenge的实现思路与练习一大致相同，只是在判断类型和返回地址时出现些许偏差。
 ## 四、实验结果
+### 练习一
 运行系统后，每触发100次时钟中断（约1秒）输出一次`100 ticks`：
 ![](lab3_1.png)
 第10次输出后调用`sbi_shutdown()`关机，符合预期。实验结果表明时钟中断处理程序正确工作，中断触发、上下文保存与恢复、定时器设置等功能均正常实现。
+
+### challenge
+系统成功捕获并处理了非法指令异常和断点异常，输出结果如下：
+![](lab3_2.png)
+结果表明异常处理机制正常工作：
+
+正确识别了异常类型（非法指令和断点）
+
+准确输出了异常触发地址
+
+成功更新了epc寄存器，使程序能够继续执行
 
 ## 五、重要知识点总结
 

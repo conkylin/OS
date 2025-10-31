@@ -44,3 +44,15 @@ void sbi_shutdown(void)
 {
 	sbi_call(SBI_SHUTDOWN, 0, 0, 0);
 }
+
+// 触发断点异常的函数
+void sbi_trigger_breakpoint(void) {
+    // 执行ebreak指令将立即触发断点异常
+    __asm__ volatile (".word 0x00100073");//ebreak
+}
+
+// 触发非法指令异常的函数
+void sbi_trigger_illegal_instruction(void) {
+    // 嵌入一个被定义为非法的指令编码
+    __asm__ volatile (".word 0x00000000");
+}

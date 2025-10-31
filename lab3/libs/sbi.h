@@ -27,4 +27,6 @@ void sbi_remote_fence_i(unsigned long hart_mask_ptr);
 unsigned long sbi_mask_interrupt(unsigned long which);
 unsigned long sbi_unmask_interrupt(unsigned long which);
 
+void sbi_trigger_breakpoint(void);
+void sbi_trigger_illegal_instruction(void);
 #endif

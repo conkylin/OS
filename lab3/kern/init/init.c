@@ -9,7 +9,7 @@
 #include <string.h>
 #include <trap.h>
 #include <dtb.h>
-
+#include<sbi.h>
 int kern_init(void) __attribute__((noreturn));
 void grade_backtrace(void);
 
@@ -32,6 +32,10 @@ int kern_init(void) {
 
     idt_init();  // init interrupt descriptor table
 
+    sbi_trigger_illegal_instruction();
+
+    sbi_trigger_breakpoint();
+    
     clock_init();   // init clock interrupt
     intr_enable();  // enable irq interrupt
 
