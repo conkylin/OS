@@ -33,9 +33,13 @@ int kern_init(void) {
     idt_init();  // init interrupt descriptor table
     
     __asm__ volatile (".word 0x00000000");
+    //intr_enable();
     //sbi_trigger_illegal_instruction();
     __asm__ volatile (".word 0x00100073");
+    //intr_enable();
     //sbi_trigger_breakpoint();
+    __asm__ volatile (".word 0x00000000");
+    //intr_enable();
     
     clock_init();   // init clock interrupt
     intr_enable();  // enable irq interrupt
