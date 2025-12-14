@@ -373,8 +373,7 @@ void exit_range(pde_t *pgdir, uintptr_t start, uintptr_t end)
  *
  * CALL GRAPH: copy_mm-->dup_mmap-->copy_range
  */
-int copy_range(pde_t *to, pde_t *from, uintptr_t start, uintptr_t end,
-               bool share)
+int copy_range(pde_t *to, pde_t *from, uintptr_t start, uintptr_t end, bool share)
 {
     assert(start % PGSIZE == 0 && end % PGSIZE == 0);
     assert(USER_ACCESS(start, end));
@@ -404,7 +403,7 @@ int copy_range(pde_t *to, pde_t *from, uintptr_t start, uintptr_t end,
             assert(page != NULL);
             assert(npage != NULL);
             int ret = 0;
-            /* LAB5:EXERCISE2 YOUR CODE
+            /* LAB5:EXERCISE2 YOUR CODE 2312482 2312364 2312163
              * replicate content of page to npage, build the map of phy addr of
              * nage with the linear addr start
              *
@@ -422,7 +421,12 @@ int copy_range(pde_t *to, pde_t *from, uintptr_t start, uintptr_t end,
              * (3) memory copy from src_kvaddr to dst_kvaddr, size is PGSIZE
              * (4) build the map of phy addr of  nage with the linear addr start
              */
+            void *src_kvaddr = page2kva(page);
+            void *dst_kvaddr = page2kva(npage);
 
+            memcpy(dst_kvaddr, src_kvaddr, PGSIZE);
+
+            ret = page_insert(to, npage, start, perm);
             assert(ret == 0);
         }
         start += PGSIZE;

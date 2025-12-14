@@ -105,13 +105,28 @@ alloc_proc(void)
          *       uint32_t flags;                             // Process flag
          *       char name[PROC_NAME_LEN + 1];               // Process name
          */
-
-        // LAB5 YOUR CODE : (update LAB4 steps)
+        proc->state = PROC_UNINIT;                 // 进程状态 - 未初始化
+        proc->pid = -1;                            // 进程ID - 无效值，等待分配
+        proc->runs = 0;                            // 运行次数 - 还未运行过
+        proc->kstack = 0;                          // 内核栈 - 还未分配
+        proc->need_resched = 0;                    // 初始不需要重新调度
+        proc->parent = NULL;                       // 还没有父进程
+        proc->mm = NULL;                           // 内存管理结构 - 还未设置
+        memset(&(proc->context), 0, sizeof(struct context));  // 清空上下文
+        proc->tf = NULL;                           // 中断帧 - 还未设置
+        proc->pgdir = boot_pgdir_pa;              // 初始使用启动页目录
+        proc->flags = 0;                           // 没有设置标志
+        memset(proc->name, 0, PROC_NAME_LEN + 1); // 清空进程名
+        // LAB5 YOUR CODE : (update LAB4 steps) 2312482 2312364 2312163
         /*
          * below fields(add in LAB5) in proc_struct need to be initialized
          *       uint32_t wait_state;                        // waiting state
          *       struct proc_struct *cptr, *yptr, *optr;     // relations between processes
          */
+        proc->wait_state = 0;        // 0 通常表示不在等待状态
+        proc->cptr = NULL;           // child pointer: 还没有孩子
+        proc->yptr = NULL;           // younger sibling: 还没有更“年轻”的兄弟
+        proc->optr = NULL;           // older sibling: 还没有更“年长”的兄弟
     }
     return proc;
 }
@@ -225,6 +240,23 @@ void proc_run(struct proc_struct *proc)
          *   lsatp():                   Modify the value of satp register
          *   switch_to():              Context switching between two processes
          */
+        bool intr_flag;
+        struct proc_struct *prev = current;
+        
+        // 关闭中断以确保原子性
+        local_intr_save(intr_flag);
+             
+        // 更新当前进程
+        current = proc;
+                
+        // 加载新进程的页目录
+        lsatp(proc->pgdir);
+                
+        // 执行从prev到current的上下文切换
+        switch_to(&(prev->context), &(proc->context));
+               
+        // 重新开启中断
+        local_intr_restore(intr_flag);
     }
 }
 
@@ -433,8 +465,35 @@ int do_fork(uint32_t clone_flags, uintptr_t stack, struct trapframe *tf)
     //    5. insert proc_struct into hash_list && proc_list
     //    6. call wakeup_proc to make the new child process RUNNABLE
     //    7. set ret vaule using child proc's pid
-
-    // LAB5 YOUR CODE : (update LAB4 steps)
+        proc = alloc_proc();
+        if (proc == NULL) {
+            goto fork_out;
+        }
+        proc->parent = current;
+        current->wait_state = 0;
+        //    2. 调用setup_kstack为子进程分配一个内核栈
+        if (setup_kstack(proc) != 0) {
+            goto bad_fork_cleanup_proc;
+        }
+        
+        //    3. 调用copy_mm根据clone_flag复制或共享mm
+        if (copy_mm(clone_flags, proc) != 0) {
+            goto bad_fork_cleanup_kstack;
+        }
+        
+        //    4. 调用copy_thread在proc_struct中设置tf和context
+        copy_thread(proc, stack, tf);
+        
+        //    5. 将proc_struct插入hash_list和proc_list
+        proc->pid = get_pid();
+        hash_proc(proc);
+        set_links(proc);
+        //    6. 调用wakeup_proc使新子进程变为RUNNABLE
+        wakeup_proc(proc);
+        
+        //    7. 使用子进程的pid设置返回值
+        ret = proc->pid;
+    // LAB5 YOUR CODE : (update LAB4 steps) 2312482 2312364 2312163
     // TIPS: you should modify your written code in lab4(step1 and step5), not add more code.
     /* Some Functions
      *    set_links:  set the relation links of process.  ALSO SEE: remove_links:  lean the relation links of process
@@ -669,7 +728,7 @@ load_icode(unsigned char *binary, size_t size)
     // Keep sstatus
     uintptr_t sstatus = tf->status;
     memset(tf, 0, sizeof(struct trapframe));
-    /* LAB5:EXERCISE1 YOUR CODE
+    /* LAB5:EXERCISE1 YOUR CODE 2312482 2312364 2312163
      * should set tf->gpr.sp, tf->epc, tf->status
      * NOTICE: If we set trapframe correctly, then the user level process can return to USER MODE from kernel. So
      *          tf->gpr.sp should be user stack top (the value of sp)
@@ -677,6 +736,9 @@ load_icode(unsigned char *binary, size_t size)
      *          tf->status should be appropriate for user program (the value of sstatus)
      *          hint: check meaning of SPP, SPIE in SSTATUS, use them by SSTATUS_SPP, SSTATUS_SPIE(defined in risv.h)
      */
+    tf->gpr.sp = USTACKTOP;
+    tf->epc = elf->e_entry;
+    tf->status = (sstatus & ~SSTATUS_SPP) | SSTATUS_SPIE;
 
     ret = 0;
 out:
@@ -811,8 +873,8 @@ found:
         remove_links(proc);
     }
     local_intr_restore(intr_flag);
-    put_kstack(proc);
-    kfree(proc);
+    put_kstack(proc);// 释放子进程的内核栈
+    kfree(proc);// 释放子进程的进程控制块(PCB)本身
     return 0;
 }
 
