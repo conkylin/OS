@@ -1,6 +1,6 @@
 ffffffffc0200000 .text
 ffffffffc0205690 .rodata
-ffffffffc02077d0 .srodata.nbase
+ffffffffc02077d8 .srodata.nbase
 ffffffffc0208000 .data
 ffffffffc02a6330 .sdata
 ffffffffc02a6340 .bss
@@ -74,20 +74,21 @@ ffffffffc020510e sys_exec
 ffffffffc020511a sys_wait
 ffffffffc0205122 sys_fork
 ffffffffc0205134 sys_exit
-ffffffffc02073c0 syscalls
+ffffffffc02073c8 syscalls
 0000000000000000 hash.c
 0000000000000000 printfmt.c
 ffffffffc02051d0 printnum
-ffffffffc0207708 error_string
+ffffffffc0207710 error_string
 0000000000000000 string.c
 0000000000000000 
 ffffffffc0215b08 _binary_obj___user_badsegment_out_start
-ffffffffc02540b0 _binary_obj___user_forktest_out_end
+ffffffffc0235668 _binary_obj___user_exit_out_end
 ffffffffc02913c8 _binary_obj___user_testbss_out_end
 ffffffffc020b010 _binary_obj___user_badarg_out_start
 ffffffffc0272278 _binary_obj___user_pgdir_out_end
 ffffffffc029c3c0 _binary_obj___user_yield_out_start
 ffffffffc025e750 _binary_obj___user_hello_out_start
+ffffffffc022a540 _binary_obj___user_exit_out_start
 ffffffffc029c3c0 _binary_obj___user_waitkill_out_end
 ffffffffc02684d0 _binary_obj___user_hello_out_end
 ffffffffc027beb8 _binary_obj___user_softint_out_end
@@ -98,7 +99,6 @@ ffffffffc02869e8 _binary_obj___user_testbss_out_start
 ffffffffc023f220 _binary_obj___user_faultreadkernel_out_start
 ffffffffc021ff98 _binary_obj___user_badsegment_out_end
 ffffffffc02869e8 _binary_obj___user_spin_out_end
-ffffffffc0249740 _binary_obj___user_forktest_out_start
 ffffffffc0215b08 _binary_obj___user_badarg_out_end
 ffffffffc0249740 _binary_obj___user_faultreadkernel_out_end
 ffffffffc025e750 _binary_obj___user_forktree_out_end
@@ -116,12 +116,12 @@ ffffffffc020a000 boot_page_table_sv39
 ffffffffc0200000 kern_entry
 ffffffffc0200336 mon_backtrace
 0000000000009d80 _binary_obj___user_hello_out_size
+ffffffffc02540b0 _binary_obj___user_forktest_out_end
 ffffffffc0202630 page_insert
 000000000000a9e0 _binary_obj___user_testbss_out_size
 ffffffffc0204fce wakeup_proc
 ffffffffc0201ca6 kallocated
 ffffffffc02035c6 pgdir_alloc_page
-ffffffffc0235668 _binary_obj___user_exit_out_end
 ffffffffc02036ac mm_create
 ffffffffc020513a syscall
 ffffffffc0200ba4 print_trapframe
@@ -148,7 +148,6 @@ ffffffffc0205672 memcpy
 ffffffffc0201d5a kfree
 ffffffffc02000a6 readline
 ffffffffc020004a kern_init
-ffffffffc022a540 _binary_obj___user_exit_out_start
 ffffffffc0203366 copy_range
 ffffffffc0201ec6 free_pages
 ffffffffc02a6340 edata
@@ -187,6 +186,7 @@ ffffffffc02009ae intr_enable
 ffffffffc0205624 strncmp
 ffffffffc0201f40 get_pte
 ffffffffc02aa7c8 current
+ffffffffc0249740 _binary_obj___user_forktest_out_start
 ffffffffc0201c86 kmalloc_init
 000000000000ab30 _binary_obj___user_spin_out_size
 ffffffffc02009b4 intr_disable
@@ -223,7 +223,7 @@ ffffffffc020a000 bootstacktop
 ffffffffc0201caa kmalloc
 ffffffffc0203f32 proc_run
 ffffffffc0208000 bootstack
-ffffffffc02077d0 nbase
+ffffffffc02077d8 nbase
 ffffffffc02a6740 free_area
 ffffffffc0203d22 user_mem_check
 ffffffffc02055be strlen
