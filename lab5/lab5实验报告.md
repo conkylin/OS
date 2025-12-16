@@ -1,7 +1,11 @@
-# uCore Lab5（COW）实验报告
+# Lab5实验报告
 
-作者：conkylin  
-实验环境：RISC-V 64（RV64）、QEMU 4.1.1、双重 GDB（riscv64-unknown-elf-gdb + host gdb attach qemu）
+## 小组成员
+| 姓名 | 学号 |
+| :--- | :--- |
+| 郑权 | 2312482 |
+| 王玉涛 | 2312364 |
+| 岳科言 | 2312163 |
 
 ---
 
