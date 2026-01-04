@@ -414,10 +414,10 @@ tf->gpr.a1 = (uintptr_t)uargv;
 Pipe 是一种典型 IPC（进程间通信）机制，语义要点包括：
 1. `pipe(int fd[2])` 创建一条单向字节流通道，返回读端 `fd[0]`、写端 `fd[1]`
 2. 读端：
-   - 若缓冲区为空且写端仍存在：阻塞等待（或非阻塞返回 EAGAIN）
+   - 若缓冲区为空且写端仍存在：阻塞等待
    - 若写端全部关闭且缓冲区为空：读返回 0（EOF）
 3. 写端：
-   - 若缓冲区满且读端仍存在：阻塞等待（或非阻塞返回 EAGAIN）
+   - 若缓冲区满且读端仍存在：阻塞等待
    - 若读端全部关闭：写返回错误（典型 UNIX 语义为 SIGPIPE/EPIPE）
 4. 与 `fork/dup/close` 的交互：
    - `fork` 后 pipe 的两端文件描述符会被复制，引用计数增加
@@ -542,6 +542,786 @@ uCore/SFS 本身已经有 `sfs_disk_inode.nlinks` 字段，可直接用于硬链
 #### 同步互斥要点
 - symlink 创建与读写需 inode 锁保护
 - 路径解析时需要注意：解析过程可能跨目录/跨 inode，多锁情况下要严格锁顺序或使用引用计数与“逐段加锁、逐段释放”的策略降低死锁风险
+
+---
+
+## lab6、练习 1：理解调度器框架的实现
+
+### 2.1 `sched_class` 结构体分析：函数指针含义、调用时机与设计原因
+
+我在 `kern/schedule/sched.h` 中看到调度类的接口定义如下：  
+
+```c
+struct sched_class
+{
+    // the name of sched_class
+    const char *name;
+    // Init the run queue
+    void (*init)(struct run_queue *rq);
+    // put the proc into runqueue, and this function must be called with rq_lock
+    void (*enqueue)(struct run_queue *rq, struct proc_struct *proc);
+    // get the proc out runqueue, and this function must be called with rq_lock
+    void (*dequeue)(struct run_queue *rq, struct proc_struct *proc);
+    // choose the next runnable task
+    struct proc_struct *(*pick_next)(struct run_queue *rq);
+    // dealer of the time-tick
+    void (*proc_tick)(struct run_queue *rq, struct proc_struct *proc);
+    /* for SMP support in the future
+     *  load_balance
+     *     void (*load_balance)(struct rq* rq);
+     *  get some proc from this rq, used in load_balance,
+     *  return value is the num of gotten proc
+     *  int (*get_proc)(struct rq* rq, struct proc* procs_moved[]);
+     */
+};
+```
+
+1）`name`  
+用于标识调度类名字，主要用于调试输出。例如 `sched_init()` 最后会打印当前调度类名称。
+
+2）`init(struct run_queue *rq)`  
+初始化运行队列内部状态。调用时机：调度器初始化阶段（`sched_init()`）。
+
+3）`enqueue(struct run_queue *rq, struct proc_struct *proc)`  
+把可运行进程加入运行队列。典型调用时机：
+- 进程被唤醒变为 runnable（`wakeup_proc()`）
+- 当前进程在 `schedule()` 中仍保持 runnable，则重新入队
+- 其它进入就绪态的路径（例如 fork 之后）也会触发入队
+
+4）`dequeue(struct run_queue *rq, struct proc_struct *proc)`  
+把进程从运行队列移除。典型调用时机：在 `schedule()` 选中 `next` 后将其出队，避免重复占用。
+
+5）`pick_next(struct run_queue *rq)`  
+选择下一个要运行的进程，这是调度策略的核心决策点。调用时机：`schedule()` 中。
+
+6）`proc_tick(struct run_queue *rq, struct proc_struct *proc)`  
+时钟 tick 处理：更新当前进程的时间片、必要时设置 `need_resched` 触发抢占。调用时机：每次时钟中断发生后。
+
+为什么要用函数指针，而不是把 RR/Stride 写死在 `schedule()` 里？  
+我的理解是：这是典型的“策略（policy）与机制（mechanism）分离”。框架提供固定骨架（临界区保护、上下文切换、安全调度点），算法通过接口注入“如何排队、如何选择、何时抢占”。这样做的直接好处是：新增/切换算法只改一个绑定点，不需要把框架改成一堆 if-else 分支。
+
+另外，`sched_class` 里还留了 SMP 扩展接口的注释（`load_balance` 等），说明这个抽象也在为将来多核调度留接口。
+
+---
+
+### 2.2 `run_queue` 结构体分析：Lab5 vs Lab6 差异与“链表 + 斜堆”并存原因
+
+我在 `kern/schedule/sched.h` 中看到 Lab6 的 `run_queue` 定义如下：  
+
+```c
+struct run_queue
+{
+    list_entry_t run_list;
+    unsigned int proc_num;
+    int max_time_slice;
+    // For LAB6 ONLY
+    skew_heap_entry_t *lab6_run_pool;
+};
+```
+
+字段含义：
+
+- `run_list`：就绪队列链表头。RR/FIFO 这类队列型算法使用它非常自然：队尾入队、队首出队。  
+- `proc_num`：就绪队列里 runnable 进程的数量，用于判断空队列以及做一致性维护。  
+- `max_time_slice`：统一的最大时间片配置，RR/Stride 都依赖它来决定抢占粒度。  
+- `lab6_run_pool`：斜堆（skew heap）根指针，用于 Stride 的优先队列实现（按最小 pass/stride 取进程）。
+
+我对 Lab5 与 Lab6 的差异理解：  
+Lab5 多数情况下只用链表支撑简单调度；Lab6 为了支持 Stride 这种“每次选择 key 最小进程”的算法，如果只用链表，每次 `pick_next` 都要 O(n) 扫描找最小值，成本明显更高。因此 Lab6 增加 `lab6_run_pool` 支持 skew heap，使得插入/删除更高效，并能快速获得“最小 key 的进程”。
+
+为什么 run_queue 要同时支持链表与斜堆？  
+我认为这是“同一框架兼容多算法”的取舍：框架只持有 `run_queue`，不希望因算法不同而换结构体类型。具体算法内部再决定用链表还是堆（Stride 里用 `USE_SKEW_HEAP` 控制），保持可扩展性。
+
+---
+
+### 2.3 框架函数分析：`sched_init()`、`wakeup_proc()`、`schedule()` 如何与算法解耦
+
+#### 2.3.1 `sched_init()`：绑定默认调度类 + 初始化 runqueue
+
+```c
+sched_init(void)
+{
+    list_init(&timer_list);
+
+    sched_class = &default_sched_class;
+
+    rq = &__rq;
+    rq->max_time_slice = MAX_TIME_SLICE;
+    sched_class->init(rq);
+
+    cprintf("sched class: %s\n", sched_class->name);
+}
+```
+
+我关注的点：
+
+- `sched_class = &default_sched_class;`：默认绑定 RR 调度类。若要启用 Stride，只需要把这里改成 `&stride_sched_class`。  
+- `rq->max_time_slice = MAX_TIME_SLICE;`：统一配置时间片上限。  
+- `sched_class->init(rq);`：调用调度类自己的 init，让“队列内部结构初始化”与框架解耦。
+
+#### 2.3.2 `wakeup_proc()`：框架负责状态切换，入队策略交给 sched_class
+
+```c
+wakeup_proc(struct proc_struct *proc)
+{
+    assert(proc->state != PROC_ZOMBIE);
+    bool intr_flag;
+    local_intr_save(intr_flag);
+    {
+        if (proc->state != PROC_RUNNABLE)
+        {
+            proc->state = PROC_RUNNABLE;
+            proc->wait_state = 0;
+            if (proc != current)
+            {
+                sched_class_enqueue(proc);
+            }
+```
+
+我的理解：
+
+- `wakeup_proc` 先把 `proc->state` 切到 `PROC_RUNNABLE`，清掉 `wait_state`；  
+- 只要唤醒的不是当前进程，就调用 `sched_class_enqueue(proc)` 把它交给具体调度类入队；  
+- 这个函数本身不关心“入队方式”，因此 RR/Stride 都能复用这条路径。
+
+#### 2.3.3 `schedule()`：框架控制流固定，策略点由接口注入
+
+```c
+schedule(void)
+{
+    bool intr_flag;
+    struct proc_struct *next;
+    local_intr_save(intr_flag);
+    {
+        current->need_resched = 0;
+        if (current->state == PROC_RUNNABLE)
+        {
+            sched_class_enqueue(current);
+        }
+```
+
+我把它拆成两层理解：
+
+- 框架固定骨架：关中断、清 `need_resched`、必要时把 current 入队、选 next、必要时出队、fallback idle、做上下文切换、恢复中断。  
+- 策略注入点：`enqueue/dequeue/pick_next` 三个关键点完全由 `sched_class` 决定，因此能做到算法可插拔。
+
+#### 2.3.4 idleproc 的特殊处理
+
+```c
+sched_class_enqueue(struct proc_struct *proc)
+{
+    if (proc != idleproc)
+    {
+        sched_class->enqueue(rq, proc);
+    }
+sched_class_proc_tick(struct proc_struct *proc)
+{
+    if (proc != idleproc)
+    {
+        sched_class->proc_tick(rq, proc);
+    }
+```
+
+我认为这两处特殊处理很关键：
+
+- idle 不入队：避免 idle 混入 RR/Stride 的正常队列导致逻辑混乱；  
+- idle tick 强制 `need_resched = 1`：配合 `cpu_idle()` 让系统在 idle 状态下每个 tick 都会尝试一次 `schedule()`，从而能及时切换到新 runnable 进程。
+
+---
+
+### 2.4 调度器使用流程分析
+
+#### 2.4.1 调度类初始化流程：从启动到 sched_init 完成
+
+1）内核完成中断/时钟初始化，使 timer interrupt 能触发；  
+2）创建并设置 `idleproc` 与 `current`；  
+3）调用 `sched_init()`：绑定 `sched_class`，初始化 `rq`，调用 `sched_class->init`；  
+4）之后每次 timer tick 都会调用 `sched_class_proc_tick(current)` 推进抢占式调度。
+
+#### 2.4.2 进程调度流程图：timer interrupt → proc_tick → schedule
+
+我在 `trap.c` 中看到 timer interrupt 会调用 `sched_class_proc_tick(current)`：
+
+```c
+    case IRQ_S_TIMER:
+        // "All bits besides SSIP and USIP in the sip register are
+        // read-only." -- privileged spec1.9.1, 4.1.4, p59
+        // In fact, Call sbi_set_timer will clear STIP, or you can clear it
+        // directly.
+        // clear_csr(sip, SIP_STIP);
+
+        /* LAB3 :填写你在lab3中实现的代码 */
+        // lab6: YOUR CODE  (update LAB3 steps)
+        //  在时钟中断时调用调度器的 sched_class_proc_tick 函数
+        clock_set_next_event();
+        ticks++;
+        sched_class_proc_tick(current);
+
+        break;
+    case IRQ_H_TIMER:
+        cprintf("Hypervisor software interrupt\n");
+        break;
+    case IRQ_M_TIMER:
+        cprintf("Machine software interrupt\n");
+        break;
+    case IRQ_U_EXT:
+        cprintf("User software interrupt\n");
+        break;
+```
+
+同时，在 trap 从用户态返回前，如果 `need_resched` 为 1 会调用 `schedule()`（节选）：
+
+```c
+
+        current->tf = otf;
+        if (!in_kernel)
+        {
+            if (current->flags & PF_EXITING)
+            {
+                do_exit(-E_KILLED);
+            }
+            if (current->need_resched)
+            {
+                schedule();
+            }
+        }
+    }
+```
+
+我把整体过程做成流程图如下：
+
+```mermaid
+flowchart TD
+  A[时钟中断 IRQ_S_TIMER] --> B[trap/interrupt handler]
+  B --> C[clock_set_next_event & ticks++]
+  C --> D[sched_class_proc_tick(current)]
+  D --> E{{current 是否 idleproc?}}
+  E -- 否 --> F[RR/Stride proc_tick: time_slice--]
+  F --> G{{time_slice == 0?}}
+  G -- 否 --> H[继续运行 current]
+  G -- 是 --> I[current.need_resched = 1]
+  E -- 是 --> J[idleproc.need_resched = 1]
+  I --> K[返回 trap]
+  J --> K
+  K --> L{{是否从用户态返回?}}
+  L -- 是 --> M{{need_resched == 1?}}
+  M -- 是 --> N[schedule()]
+  M -- 否 --> O[返回用户态继续]
+  L -- 否 --> P[回到内核线程/idleproc]
+  P --> Q{{cpu_idle 循环里 need_resched?}}
+  Q -- 是 --> N
+  Q -- 否 --> P
+```
+
+其中 `need_resched` 在我理解里是“延迟调度请求标志”：tick 中断里只置位，真正调度发生在 trap 返回用户态前或 idle 循环的安全点，避免在中断上下文随意切换带来的复杂性。
+
+#### 2.4.3 调度算法切换机制：如何新增/切换（以 Stride 为例）
+
+如果我要切换到 Stride，我需要改动非常集中：
+
+1）`sched_init()`：把 `sched_class = &default_sched_class;` 改为 `&stride_sched_class;`  
+2）保证 `default_sched_stride.c` 完整实现 `init/enqueue/dequeue/pick_next/proc_tick`  
+3）保证 `proc_struct` 与 `run_queue` 的 Stride 相关字段存在并初始化
+
+之所以切换容易，是因为 `schedule()` 的控制流不变，只是通过 `sched_class` 指针调用不同实现。
+
+---
+
+## lab6、练习 2：实现 Round Robin（RR）调度算法
+
+### 3.1 选择一个 Lab5/Lab6 实现不同的函数进行比较：`schedule()` 的框架化
+
+我认为 Lab6 相比 Lab5 的关键变化之一就是：`schedule()` 不再写死队列操作，而是通过 `sched_class` 抽象出策略点（enqueue/dequeue/pick_next/proc_tick）。  
+如果不做这个改动，Stride 这种“按最小 key 取进程”的策略就很难融入，并且会造成严重耦合：每新增一种算法就要改动 `schedule()` 甚至唤醒路径，最终演变为难维护的分支堆叠。
+
+---
+
+### 3.2 RR 的实现位置与目标
+
+RR 要求：队尾入队、队首出队；每个进程运行固定时间片，时间片耗尽后触发切换，并把当前进程重新入队到队尾。
+
+我在 `kern/schedule/default_sched.c` 中实现/检查了 5 个函数：`RR_init/RR_enqueue/RR_dequeue/RR_pick_next/RR_proc_tick`。
+
+---
+
+### 3.3 `RR_init`：初始化队列
+
+```c
+RR_init(struct run_queue *rq)
+{
+    // LAB6: YOUR CODE
+    list_init(&(rq->run_list));
+    rq->proc_num = 0;
+}
+```
+
+我用 `list_init` 初始化就绪链表，`proc_num=0` 表示空队列。
+
+---
+
+### 3.4 `RR_enqueue`：队尾入队 + 时间片修正 + 维护一致性
+
+```c
+RR_enqueue(struct run_queue *rq, struct proc_struct *proc)
+{
+    // LAB6: YOUR CODE
+    assert(list_empty(&(proc->run_link)));
+    list_add_before(&(rq->run_list), &(proc->run_link));
+    if (proc->time_slice == 0 || proc->time_slice > rq->max_time_slice) {
+        proc->time_slice = rq->max_time_slice;
+    }
+    proc->rq = rq;
+    rq->proc_num++;
+}
+```
+
+我这里选择 `list_add_before(&rq->run_list, &proc->run_link)` 来实现队尾插入。原因是 `run_list` 是哨兵头结点，在 head 之前插入等价于插入到链表最后，满足 RR 的 FIFO 入队语义。
+
+时间片修正逻辑的目的：  
+- `time_slice==0` 表示耗尽或未初始化，重新入队必须补满；  
+- `time_slice` 异常过大也强制收敛，避免逻辑错误导致进程长期不被抢占。
+
+---
+
+### 3.5 `RR_dequeue`：出队并初始化节点
+
+```c
+RR_dequeue(struct run_queue *rq, struct proc_struct *proc)
+{
+    // LAB6: YOUR CODE
+    assert(!list_empty(&(proc->run_link)) && proc->rq == rq);
+    list_del_init(&(proc->run_link));
+    rq->proc_num--;
+}
+```
+
+我使用 `list_del_init` 而不是仅删除，是为了把节点恢复到“未入队”的安全状态，后续 `assert(list_empty(&run_link))` 能更可靠地发现重复入队错误。
+
+---
+
+### 3.6 `RR_pick_next`：取队首
+
+```c
+RR_pick_next(struct run_queue *rq)
+{
+    // LAB6: YOUR CODE
+    list_entry_t *le = list_next(&(rq->run_list));
+    if (le != &(rq->run_list)) {
+        return le2proc(le, run_link);
+    }
+    return NULL;
+}
+```
+
+空队列返回 NULL，框架会 fallback 到 idleproc；非空则用 `le2proc` 把 `list_entry_t` 转回 `proc_struct*`。
+
+---
+
+### 3.7 `RR_proc_tick`：时间片递减与抢占触发
+
+```c
+RR_proc_tick(struct run_queue *rq, struct proc_struct *proc)
+{
+    // LAB6: YOUR CODE
+    if (proc->time_slice > 0) {
+        proc->time_slice--;
+    }
+    if (proc->time_slice == 0) {
+        proc->need_resched = 1;
+    }
+}
+```
+
+当 `time_slice==0` 时置 `need_resched=1`，使得抢占式 RR 生效。如果不置位，CPU-bound 进程会一直运行，RR 退化为非抢占式甚至类似 FIFO。
+
+---
+
+### 3.8 边界条件与异常处理
+
+- 空队列：`RR_pick_next` 返回 NULL → `schedule()` 选 idle；  
+- 重复入队：`assert(list_empty(&proc->run_link))` 防止结构损坏；  
+- 重复出队：`list_del_init` + assert 防止二次删除；  
+- 时间片异常：统一修正到 `max_time_slice`；  
+- idle 进程：框架层排除，不参与 RR 队列。
+
+---
+
+## lab6、Challenge 1：实现 Stride Scheduling
+
+### 4.1 Stride 的目标与核心思想
+
+Stride 的目标是按权重比例公平：priority 更大者获得更多 CPU 份额。做法是维护每个进程的虚拟进度 pass，每次被调度就把 pass 增加 `BIG_STRIDE/priority`，并始终选择 pass 最小者运行。
+
+---
+
+### 4.2 数据结构：`proc_struct`、`run_queue` 与初始化
+
+#### 4.2.1 `proc_struct` 字段（节选）
+
+```c
+    int exit_code;                          // exit code (be sent to parent proc)
+    uint32_t wait_state;                    // waiting state
+    struct proc_struct *cptr, *yptr, *optr; // relations between processes
+    struct run_queue *rq;                   // running queue contains Process
+    list_entry_t run_link;                  // the entry linked in run queue
+    int time_slice;                         // time slice for occupying the CPU
+    skew_heap_entry_t lab6_run_pool;        // FOR LAB6 ONLY: the entry in the run pool
+    uint32_t lab6_stride;                   // FOR LAB6 ONLY: the current stride of the process
+    uint32_t lab6_priority;                 // FOR LAB6 ONLY: the priority of process, set by lab6_set_priority(uint32_t)
+};
+
+#define PF_EXITING 0x00000001 // getting shutdown
+
+#define WT_CHILD (0x00000001 | WT_INTERRUPTED)
+#define WT_INTERRUPTED 0x80000000 // the wait state could be interrupted
+
+#define le2proc(le, member) \
+    to_struct((le), struct proc_struct, member)
+
+extern struct proc_struct *idleproc, *initproc, *current;
+
+void proc_init(void);
+void proc_run(struct proc_struct *proc);
+int kernel_thread(int (*fn)(void *), void *arg, uint32_t clone_flags);
+
+char *set_proc_name(struct proc_struct *proc, const char *name);
+char *get_proc_name(struct proc_struct *proc);
+void cpu_idle(void) __attribute__((noreturn));
+
+// FOR LAB6, set the process's priority (bigger value will get more CPU time)
+void lab6_set_priority(uint32_t priority);
+
+struct proc_struct *find_proc(int pid);
+int do_fork(uint32_t clone_flags, uintptr_t stack, struct trapframe *tf);
+int do_exit(int error_code);
+int do_yield(void);
+```
+
+#### 4.2.2 `alloc_proc()` 初始化（节选）
+
+```c
+
+        // LAB5:填写你在lab5中实现的代码 (update LAB4 steps)
+        proc->wait_state = 0;        // 0 通常表示不在等待状态
+        proc->cptr = NULL;           // child pointer: 还没有孩子
+        proc->yptr = NULL;           // younger sibling: 还没有更"年轻"的兄弟
+        proc->optr = NULL;           // older sibling: 还没有更"年长"的兄弟
+
+        // LAB6:YOUR CODE (update LAB5 steps)
+        proc->rq = NULL;             // 运行队列
+        list_init(&(proc->run_link)); // 初始化运行队列链表项
+        proc->time_slice = 0;        // 时间片
+        proc->lab6_run_pool.left = proc->lab6_run_pool.right = proc->lab6_run_pool.parent = NULL;
+        proc->lab6_stride = 0;       // stride值
+        proc->lab6_priority = 0;     // 优先级
+    }
+    return proc;
+}
+
+```
+
+把 `lab6_stride` 初始化为 0，`lab6_priority` 初始化为 0，并在后续计算时对 priority=0 做保护（或由系统调用改为至少 1）。
+
+---
+
+### 4.3 priority 设置链路：syscall + 内核函数
+
+syscall：
+
+```c
+sys_lab6_set_priority(uint64_t arg[]){
+    uint64_t priority = (uint64_t)arg[0];
+    lab6_set_priority(priority);
+    return 0;
+}
+```
+
+内核实际设置：
+
+```c
+void lab6_set_priority(uint32_t priority)
+{
+    cprintf("set priority to %d\n", priority);
+    if (priority == 0)
+        current->lab6_priority = 1;
+    else
+        current->lab6_priority = priority;
+}
+```
+
+priority=0 时强制设为 1，是为了避免除 0。
+
+---
+
+### 4.4 Stride 调度类逐函数解释
+
+比较函数：
+
+```c
+proc_stride_comp_f(void *a, void *b)
+{
+     struct proc_struct *p = le2proc(a, lab6_run_pool);
+     struct proc_struct *q = le2proc(b, lab6_run_pool);
+     int32_t c = p->lab6_stride - q->lab6_stride;
+     if (c > 0)
+          return 1;
+     else if (c == 0)
+          return 0;
+     else
+          return -1;
+}
+```
+
+初始化：
+
+```c
+stride_init(struct run_queue *rq)
+{
+     /* LAB6 CHALLENGE 1: YOUR CODE
+      * (1) init the ready process list: rq->run_list
+      * (2) init the run pool: rq->lab6_run_pool
+      * (3) set number of process: rq->proc_num to 0
+      */
+     list_init(&(rq->run_list));
+     rq->lab6_run_pool = NULL;
+     rq->proc_num = 0;
+}
+```
+
+入队：
+
+```c
+stride_enqueue(struct run_queue *rq, struct proc_struct *proc)
+{
+     /* LAB6 CHALLENGE 1: YOUR CODE
+      * (1) insert the proc into rq correctly
+      * NOTICE: you can use skew_heap or list. Important functions
+      *         skew_heap_insert: insert a entry into skew_heap
+      *         list_add_before: insert  a entry into the last of list
+      * (2) recalculate proc->time_slice
+      * (3) set proc->rq pointer to rq
+      * (4) increase rq->proc_num
+      */
+#if USE_SKEW_HEAP
+     rq->lab6_run_pool = skew_heap_insert(rq->lab6_run_pool, &(proc->lab6_run_pool), proc_stride_comp_f);
+#else
+     list_add_before(&(rq->run_list), &(proc->run_link));
+#endif
+     if (proc->time_slice == 0 || proc->time_slice > rq->max_time_slice) {
+          proc->time_slice = rq->max_time_slice;
+     }
+     proc->rq = rq;
+     rq->proc_num++;
+}
+```
+
+出队：
+
+```c
+stride_dequeue(struct run_queue *rq, struct proc_struct *proc)
+{
+     /* LAB6 CHALLENGE 1: YOUR CODE
+      * (1) remove the proc from rq correctly
+      * NOTICE: you can use skew_heap or list. Important functions
+      *         skew_heap_remove: remove a entry from skew_heap
+      *         list_del_init: remove a entry from the  list
+      */
+#if USE_SKEW_HEAP
+     rq->lab6_run_pool = skew_heap_remove(rq->lab6_run_pool, &(proc->lab6_run_pool), proc_stride_comp_f);
+#else
+     assert(!list_empty(&(proc->run_link)) && proc->rq == rq);
+     list_del_init(&(proc->run_link));
+#endif
+     rq->proc_num--;
+}
+```
+
+选择下一个并更新 pass：
+
+```c
+stride_pick_next(struct run_queue *rq)
+{
+     /* LAB6 CHALLENGE 1: YOUR CODE
+      * (1) get a  proc_struct pointer p  with the minimum value of stride
+             (1.1) If using skew_heap, we can use le2proc get the p from rq->lab6_run_pol
+             (1.2) If using list, we have to search list to find the p with minimum stride value
+      * (2) update p;s stride value: p->lab6_stride
+      * (3) return p
+      */
+#if USE_SKEW_HEAP
+     if (rq->lab6_run_pool == NULL) {
+          return NULL;
+     }
+     struct proc_struct *p = le2proc(rq->lab6_run_pool, lab6_run_pool);
+#else
+     list_entry_t *le = list_next(&(rq->run_list));
+     if (le == &(rq->run_list)) {
+          return NULL;
+     }
+     struct proc_struct *p = le2proc(le, run_link);
+     le = list_next(le);
+     while (le != &(rq->run_list)) {
+          struct proc_struct *q = le2proc(le, run_link);
+          if ((int32_t)(q->lab6_stride - p->lab6_stride) < 0) {
+               p = q;
+          }
+          le = list_next(le);
+     }
+#endif
+     if (p->lab6_priority == 0) {
+          p->lab6_stride += BIG_STRIDE;
+     } else {
+          p->lab6_stride += BIG_STRIDE / p->lab6_priority;
+     }
+     return p;
+}
+```
+
+tick 驱动抢占：
+
+```c
+stride_proc_tick(struct run_queue *rq, struct proc_struct *proc)
+{
+     /* LAB6 CHALLENGE 1: YOUR CODE */
+     if (proc->time_slice > 0) {
+          proc->time_slice--;
+     }
+     if (proc->time_slice == 0) {
+          proc->need_resched = 1;
+     }
+}
+```
+
+我认为这里最关键的是 `stride_pick_next`：选最小 pass 的进程，并在选中后更新其 pass（`pass += BIG_STRIDE/priority`），从而实现比例公平。
+
+---
+
+### 4.5 为什么“时间片数 ∝ priority”
+
+如果进程 i 每获得一次时间片，其 pass 增加 `BIG_STRIDE/p_i`。当它获得 k_i 次时间片后，pass 增量约为 `k_i*BIG_STRIDE/p_i`。调度器总选 pass 最小者运行，会让各进程 pass 长期维持在同一数量级（否则 pass 大的会长期得不到运行，pass 小的会频繁运行直到追平）。因此长期平均上有：
+
+`k_i*BIG_STRIDE/p_i ≈ k_j*BIG_STRIDE/p_j`  
+推出 `k_i/k_j ≈ p_i/p_j`，即时间片分配近似与 priority 成比例。
+
+---
+
+### 4.6 多级反馈队列（MLFQ）调度算法设计
+
+我给出一个可落地到 uCore 的设计方案：
+
+- run_queue：L 个队列 `mlfq[L]`（每级一个链表），各自 quantum 不同；  
+- proc_struct：增加 `mlfq_level`、`ticks_left`、`last_enqueue_tick`；  
+- pick_next：从最高级队列找到第一个非空队列取队首；同级内部 RR；  
+- 用完 quantum 不阻塞 → 降级（惩罚 CPU-bound）；提前阻塞 → 保持/提升（奖励交互）；  
+- 防饥饿：periodic boost（周期性把所有 runnable 提升到最高级）或 aging（等待过久提升）。
+
+MLFQ 也可以作为独立 `sched_class` 实现，不改 `schedule()` 主流程。
+
+---
+
+### 4.7 `priority` 用户程序
+
+```c
+#include <ulib.h>
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+
+#define TOTAL 5
+/* to get enough accuracy, MAX_TIME (the running time of each process) should >1000 mseconds. */
+#define MAX_TIME  2000
+unsigned int acc[TOTAL];
+int status[TOTAL];
+int pids[TOTAL];
+
+static void
+spin_delay(void)
+{
+     int i;
+     volatile int j;
+     for (i = 0; i != 200; ++ i)
+     {
+          j = !j;
+     }
+}
+
+int
+main(void) {
+     int i,time;
+     memset(pids, 0, sizeof(pids));
+     lab6_setpriority(TOTAL + 1);
+
+     for (i = 0; i < TOTAL; i ++) {
+          acc[i]=0;
+          if ((pids[i] = fork()) == 0) {
+               lab6_setpriority(i + 1);
+               acc[i] = 0;
+               while (1) {
+                    spin_delay();
+                    ++ acc[i];
+                    if(acc[i]%4000==0) {
+                        if((time=gettime_msec())>MAX_TIME) {
+                            cprintf("child pid %d, acc %d, time %d\n",getpid(),acc[i],time);
+                            exit(acc[i]);
+                        }
+                    }
+               }
+               
+          }
+          if (pids[i] < 0) {
+               goto failed;
+          }
+     }
+
+     cprintf("main: fork ok,now need to wait pids.\n");
+
+     for (i = 0; i < TOTAL; i ++) {
+         status[i]=0;
+         waitpid(pids[i],&status[i]);
+         cprintf("main: pid %d, acc %d, time %d\n",pids[i],status[i],gettime_msec()); 
+     }
+     cprintf("main: wait pids over\n");
+     cprintf("sched result:");
+     for (i = 0; i < TOTAL; i ++)
+     {
+         cprintf(" %d", (status[i] * 2 / status[0] + 1) / 2);
+     }
+     cprintf("\n");
+
+     return 0;
+
+failed:
+     for (i = 0; i < TOTAL; i ++) {
+          if (pids[i] > 0) {
+               kill(pids[i]);
+          }
+     }
+     panic("FAIL: T.T\n");
+}
+
+```
+---
+
+## lab6、Challenge 2：实现更多调度算法 
+
+### 5.1 目标与总体思路
+
+Challenge 2 的重点是：实现多种调度算法，并通过统一插桩与统一 workload，定量对比不同算法在响应时间、等待时间、周转时间、吞吐、公平性、上下文切换开销等方面的差异，最后总结适用范围。
+
+### 5.2 算法实现方式：一算法一 `sched_class`
+
+我倾向把每种算法都写成一个独立 sched_class（例如 `fifo_sched_class/sjf_sched_class/mlfq_sched_class`），这样切换算法只需要改 `sched_init()` 的绑定点，控制变量明确，便于对比实验。
+
+### 5.3 指标体系与插桩位置
+
+- create_tick：fork 时记录  
+- first_run_tick：第一次被调度运行时记录  
+- exit_tick：退出时记录  
+- waiting_time：enqueue 时记录时间戳，dequeue 时累加等待  
+- cpu_ticks：每 tick 若当前进程运行则累加  
+- ctx_switches：统计 `proc_run()` 次数
+
+公平性可用 Jain 指数，也可以直接用 `cpu_ticks` 比例来验证 RR（近似相等）与 Stride（按权重比例）。
 
 ---
 
